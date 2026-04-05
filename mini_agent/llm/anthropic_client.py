@@ -312,7 +312,6 @@ class AnthropicClient(LLMClientBase):
             "model": self.model,
             "max_tokens": 16384,
             "messages": api_messages,
-            "stream": True,
         }
 
         if system_message:
