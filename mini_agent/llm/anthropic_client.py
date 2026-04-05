@@ -319,52 +319,54 @@ class AnthropicClient(LLMClientBase):
         if tools:
             params["tools"] = self._convert_tools(tools)
 
-        # Buffer for partial tool calls indexed by block index
+        # Buffer for partial tool calls (indexed by block index).
+        # Note: MiniMax sends both top-level text/thinking events AND
+        # content_block_delta events — we use top-level events for text/thinking
+        # (they arrive first with full content) and content_block_delta only for tool_use.
         tool_call_buffer: dict[int, dict[str, Any]] = {}
 
         async with self.client.messages.stream(**params) as stream:
             async for event in stream:
-                # Top-level event types with content directly on event
+                # Top-level event types: these arrive BEFORE content_block_delta
+                # and carry the complete content for each block. Skip content_block_delta
+                # for text/thinking to avoid double-yielding.
                 if event.type == "text":
                     yield StreamChunk(type="content", text=event.text)
+                    continue
                 elif event.type == "thinking":
                     yield StreamChunk(type="thinking", text=event.thinking)
+                    continue
                 elif event.type == "signature":
                     # Signature events don't contain content to stream
-                    pass
-                # Handle content_block_start (buffer setup)
-                elif hasattr(event, "content_block") and event.type == "content_block_start":
+                    continue
+
+                # Handle content_block_start (buffer setup for tool calls;
+                # text/thinking blocks are handled via top-level events above)
+                if hasattr(event, "content_block") and event.type == "content_block_start":
                     block = event.content_block
                     idx = event.index
-                    if block.type == "text":
-                        tool_call_buffer[idx] = {"type": "text", "text": ""}
-                    elif block.type == "thinking":
-                        tool_call_buffer[idx] = {"type": "thinking", "thinking": ""}
-                    elif block.type == "tool_use":
+                    if block.type == "tool_use":
                         tool_call_buffer[idx] = {
                             "type": "tool_use",
                             "id": block.id,
                             "name": block.name,
                             "input": "",
                         }
+                    continue
 
-                # Handle content_block_delta (content inside block.delta)
-                elif hasattr(event, "content_block") and event.type == "content_block_delta":
+                # Handle content_block_delta (only for tool_use; text/thinking
+                # deltas are skipped since top-level events already yielded the full content)
+                if hasattr(event, "content_block") and event.type == "content_block_delta":
                     block = event.content_block
                     idx = event.index
                     delta = block.delta
-                    if block.type == "text" and hasattr(delta, "text"):
-                        yield StreamChunk(type="content", text=delta.text)
-                    elif block.type == "thinking" and hasattr(delta, "thinking"):
-                        yield StreamChunk(type="thinking", text=delta.thinking)
-                    elif block.type == "tool_use":
+                    if block.type == "tool_use":
                         if hasattr(delta, "input"):
                             tool_call_buffer[idx]["input"] += delta.input
                         # Check if tool call is complete by trying to parse
                         args_str = tool_call_buffer[idx]["input"]
                         try:
                             parsed = json.loads(args_str) if args_str else {}
-                            # Complete!
                             yield StreamChunk(
                                 type="tool_call_complete",
                                 tool_call=ToolCall(
@@ -378,12 +380,12 @@ class AnthropicClient(LLMClientBase):
                             )
                             del tool_call_buffer[idx]
                         except json.JSONDecodeError:
-                            # Incomplete
                             yield StreamChunk(
                                 type="tool_call_delta",
                                 tool_call_id=tool_call_buffer[idx]["id"],
                                 arguments=args_str,
                             )
+                    continue
 
                 # Handle message_delta (final)
                 elif event.type == "message_delta":
