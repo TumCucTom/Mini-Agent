@@ -314,6 +314,12 @@ Examples:
         help="Execute a task non-interactively and exit",
     )
     parser.add_argument(
+        "--no-stream",
+        action="store_true",
+        default=False,
+        help="Disable streaming output (use non-streaming generate)",
+    )
+    parser.add_argument(
         "--version",
         "-v",
         action="version",
@@ -483,7 +489,7 @@ async def _quiet_cleanup():
         pass
 
 
-async def run_agent(workspace_dir: Path, task: str = None):
+async def run_agent(workspace_dir: Path, task: str = None, stream: bool = True):
     """Run Agent in interactive or non-interactive mode.
 
     Args:
@@ -607,6 +613,7 @@ async def run_agent(workspace_dir: Path, task: str = None):
         tools=tools,
         max_steps=config.agent.max_steps,
         workspace_dir=str(workspace_dir),
+        stream=stream,
     )
 
     # 8. Display welcome information
@@ -866,7 +873,7 @@ def main():
     workspace_dir.mkdir(parents=True, exist_ok=True)
 
     # Run the agent (config always loaded from package directory)
-    asyncio.run(run_agent(workspace_dir, task=args.task))
+    asyncio.run(run_agent(workspace_dir, task=args.task, stream=not args.no_stream))
 
 
 if __name__ == "__main__":

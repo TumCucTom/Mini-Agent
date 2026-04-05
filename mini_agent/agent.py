@@ -53,11 +53,13 @@ class Agent:
         max_steps: int = 50,
         workspace_dir: str = "./workspace",
         token_limit: int = 80000,  # Summary triggered when tokens exceed this value
+        stream: bool = True,  # Enable streaming by default
     ):
         self.llm = llm_client
         self.tools = {tool.name: tool for tool in tools}
         self.max_steps = max_steps
         self.token_limit = token_limit
+        self.stream = stream
         self.workspace_dir = Path(workspace_dir)
         # Cancellation event for interrupting agent execution (set externally, e.g., by Esc key)
         self.cancel_event: Optional[asyncio.Event] = None
@@ -318,6 +320,319 @@ Requirements:
             # Use simple text summary on failure
             return summary_content
 
+    async def _execute_tool_calls(
+        self,
+        tool_calls: list,
+        assistant_msg: Message,
+    ) -> str | None:
+        """Execute a list of tool calls and add results to message history.
+
+        Args:
+            tool_calls: List of ToolCall objects to execute
+            assistant_msg: The assistant message containing the tool calls
+
+        Returns:
+            None if all tool calls executed successfully or error message if cancelled
+        """
+        for tool_call in tool_calls:
+            tool_call_id = tool_call.id
+            function_name = tool_call.function.name
+            arguments = tool_call.function.arguments
+
+            # Tool call header
+            print(f"\n{Colors.BRIGHT_YELLOW}🔧 Tool Call:{Colors.RESET} {Colors.BOLD}{Colors.CYAN}{function_name}{Colors.RESET}")
+
+            # Arguments (formatted display)
+            print(f"{Colors.DIM}   Arguments:{Colors.RESET}")
+            # Truncate each argument value to avoid overly long output
+            truncated_args = {}
+            for key, value in arguments.items():
+                value_str = str(value)
+                if len(value_str) > 200:
+                    truncated_args[key] = value_str[:200] + "..."
+                else:
+                    truncated_args[key] = value
+            args_json = json.dumps(truncated_args, indent=2, ensure_ascii=False)
+            for line in args_json.split("\n"):
+                print(f"   {Colors.DIM}{line}{Colors.RESET}")
+
+            # Execute tool
+            if function_name not in self.tools:
+                result = ToolResult(
+                    success=False,
+                    content="",
+                    error=f"Unknown tool: {function_name}",
+                )
+            else:
+                try:
+                    tool = self.tools[function_name]
+                    result = await tool.execute(**arguments)
+                except Exception as e:
+                    # Catch all exceptions during tool execution, convert to failed ToolResult
+                    import traceback
+
+                    error_detail = f"{type(e).__name__}: {str(e)}"
+                    error_trace = traceback.format_exc()
+                    result = ToolResult(
+                        success=False,
+                        content="",
+                        error=f"Tool execution failed: {error_detail}\n\nTraceback:\n{error_trace}",
+                    )
+
+            # Log tool execution result
+            self.logger.log_tool_result(
+                tool_name=function_name,
+                arguments=arguments,
+                result_success=result.success,
+                result_content=result.content if result.success else None,
+                result_error=result.error if not result.success else None,
+            )
+
+            # Print result
+            if result.success:
+                result_text = result.content
+                if len(result_text) > 300:
+                    result_text = result_text[:300] + f"{Colors.DIM}...{Colors.RESET}"
+                print(f"{Colors.BRIGHT_GREEN}✓ Result:{Colors.RESET} {result_text}")
+            else:
+                print(f"{Colors.BRIGHT_RED}✗ Error:{Colors.RESET} {Colors.RED}{result.error}{Colors.RESET}")
+
+            # Add tool result message
+            tool_msg = Message(
+                role="tool",
+                content=result.content if result.success else f"Error: {result.error}",
+                tool_call_id=tool_call_id,
+                name=function_name,
+            )
+            self.messages.append(tool_msg)
+
+            # Check for cancellation after each tool execution
+            if self._check_cancelled():
+                self._cleanup_incomplete_messages()
+                cancel_msg = "Task cancelled by user."
+                print(f"\n{Colors.BRIGHT_YELLOW}⚠️  {cancel_msg}{Colors.RESET}")
+                return cancel_msg
+
+        return None
+
+
+    async def _run_step_stream(
+        self,
+        tool_list: list,
+        step_start_time: float,
+        run_start_time: float,
+    ) -> str | None:
+        """Run a single agent step using streaming.
+
+        Streams LLM output in real-time, buffers tool calls until complete,
+        then executes them once the full response is received.
+
+        Args:
+            tool_list: List of available tools
+            step_start_time: Start time of this step
+            run_start_time: Start time of the entire run
+
+        Returns:
+            None to continue to next step, or a string (content/cancel/error) to return
+        """
+        from .retry import RetryExhaustedError
+        from .schema import FunctionCall, ToolCall
+
+        # Buffers for accumulating response
+        thinking_content = ""
+        text_content = ""
+        tool_calls_buffer: dict[str, dict] = {}  # id -> {name, arguments}
+
+        finish_reason = "stop"
+        total_usage = None
+
+        try:
+            async for chunk in self.llm.generate_stream(messages=self.messages, tools=tool_list):
+                if chunk.type == "thinking":
+                    thinking_content += chunk.text or ""
+                elif chunk.type == "content":
+                    text_content += chunk.text or ""
+                elif chunk.type == "tool_call_delta":
+                    # Partial tool call - accumulate arguments
+                    tid = chunk.tool_call_id
+                    if tid not in tool_calls_buffer:
+                        tool_calls_buffer[tid] = {"name": "", "arguments": ""}
+                    tool_calls_buffer[tid]["arguments"] += chunk.arguments or ""
+                elif chunk.type == "tool_call_complete":
+                    # Complete tool call received
+                    tc = chunk.tool_call
+                    tool_calls_buffer[tc.id] = {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    }
+                elif chunk.type == "done":
+                    finish_reason = chunk.finish_reason or "stop"
+                    total_usage = chunk.usage
+
+        except Exception as e:
+            if isinstance(e, RetryExhaustedError):
+                error_msg = f"LLM call failed after {e.attempts} retries\nLast error: {str(e.last_exception)}"
+                print(f"\n{Colors.BRIGHT_RED}❌ Retry failed:{Colors.RESET} {error_msg}")
+            else:
+                error_msg = f"LLM call failed: {str(e)}"
+                print(f"\n{Colors.BRIGHT_RED}❌ Error:{Colors.RESET} {error_msg}")
+            return error_msg
+
+        # Accumulate token usage
+        if total_usage:
+            self.api_total_tokens = total_usage.total_tokens
+
+        # Build final tool calls list
+        final_tool_calls = None
+        if tool_calls_buffer:
+            final_tool_calls = [
+                ToolCall(
+                    id=tid,
+                    type="function",
+                    function=FunctionCall(
+                        name=data["name"],
+                        arguments=data["arguments"],
+                    ),
+                )
+                for tid, data in tool_calls_buffer.items()
+            ]
+
+        # Log LLM response
+        self.logger.log_response(
+            content=text_content,
+            thinking=thinking_content if thinking_content else None,
+            tool_calls=final_tool_calls,
+            finish_reason=finish_reason,
+        )
+
+        # Add assistant message to history
+        assistant_msg = Message(
+            role="assistant",
+            content=text_content,
+            thinking=thinking_content if thinking_content else None,
+            tool_calls=final_tool_calls,
+        )
+        self.messages.append(assistant_msg)
+
+        # Print thinking if present
+        if thinking_content:
+            print(f"\n{Colors.BOLD}{Colors.MAGENTA}🧠 Thinking:{Colors.RESET}")
+            print(f"{Colors.DIM}{thinking_content}{Colors.RESET}")
+
+        # Print assistant response
+        if text_content:
+            print(f"\n{Colors.BOLD}{Colors.BRIGHT_BLUE}🤖 Assistant:{Colors.RESET}")
+            print(f"{text_content}")
+
+        # Check if task is complete (no tool calls)
+        if not final_tool_calls:
+            step_elapsed = perf_counter() - step_start_time
+            total_elapsed = perf_counter() - run_start_time
+            print(f"\n{Colors.DIM}⏱️  Step completed in {step_elapsed:.2f}s (total: {total_elapsed:.2f}s){Colors.RESET}")
+            return text_content
+
+        # Check for cancellation before executing tools
+        if self._check_cancelled():
+            self._cleanup_incomplete_messages()
+            print(f"\n{Colors.BRIGHT_YELLOW}⚠️  Task cancelled by user.{Colors.RESET}")
+            return "Task cancelled by user."
+
+        # Execute tool calls
+        cancel_result = await self._execute_tool_calls(final_tool_calls, assistant_msg)
+        if cancel_result:
+            return cancel_result
+
+        step_elapsed = perf_counter() - step_start_time
+        total_elapsed = perf_counter() - run_start_time
+        print(f"\n{Colors.DIM}⏱️  Step completed in {step_elapsed:.2f}s (total: {total_elapsed:.2f}s){Colors.RESET}")
+
+        # Increment step counter and continue loop
+        return None
+
+    async def _run_step_nonstream(
+        self,
+        tool_list: list,
+        step_start_time: float,
+        run_start_time: float,
+    ) -> str | None:
+        """Run a single agent step using non-streaming generate().
+
+        Args:
+            tool_list: List of available tools
+            step_start_time: Start time of this step
+            run_start_time: Start time of the entire run
+
+        Returns:
+            None to continue to next step, or a string (content/cancel/error) to return
+        """
+        from .retry import RetryExhaustedError
+
+        try:
+            response = await self.llm.generate(messages=self.messages, tools=tool_list)
+        except Exception as e:
+            if isinstance(e, RetryExhaustedError):
+                error_msg = f"LLM call failed after {e.attempts} retries\nLast error: {str(e.last_exception)}"
+                print(f"\n{Colors.BRIGHT_RED}❌ Retry failed:{Colors.RESET} {error_msg}")
+            else:
+                error_msg = f"LLM call failed: {str(e)}"
+                print(f"\n{Colors.BRIGHT_RED}❌ Error:{Colors.RESET} {error_msg}")
+            return error_msg
+
+        # Accumulate API reported token usage
+        if response.usage:
+            self.api_total_tokens = response.usage.total_tokens
+
+        # Log LLM response
+        self.logger.log_response(
+            content=response.content,
+            thinking=response.thinking,
+            tool_calls=response.tool_calls,
+            finish_reason=response.finish_reason,
+        )
+
+        # Add assistant message
+        assistant_msg = Message(
+            role="assistant",
+            content=response.content,
+            thinking=response.thinking,
+            tool_calls=response.tool_calls,
+        )
+        self.messages.append(assistant_msg)
+
+        # Print thinking if present
+        if response.thinking:
+            print(f"\n{Colors.BOLD}{Colors.MAGENTA}🧠 Thinking:{Colors.RESET}")
+            print(f"{Colors.DIM}{response.thinking}{Colors.RESET}")
+
+        # Print assistant response
+        if response.content:
+            print(f"\n{Colors.BOLD}{Colors.BRIGHT_BLUE}🤖 Assistant:{Colors.RESET}")
+            print(f"{response.content}")
+
+        # Check if task is complete (no tool calls)
+        if not response.tool_calls:
+            step_elapsed = perf_counter() - step_start_time
+            total_elapsed = perf_counter() - run_start_time
+            print(f"\n{Colors.DIM}⏱️  Step completed in {step_elapsed:.2f}s (total: {total_elapsed:.2f}s){Colors.RESET}")
+            return response.content
+
+        # Check for cancellation before executing tools
+        if self._check_cancelled():
+            self._cleanup_incomplete_messages()
+            print(f"\n{Colors.BRIGHT_YELLOW}⚠️  Task cancelled by user.{Colors.RESET}")
+            return "Task cancelled by user."
+
+        # Execute tool calls
+        cancel_result = await self._execute_tool_calls(response.tool_calls, assistant_msg)
+        if cancel_result:
+            return cancel_result
+
+        step_elapsed = perf_counter() - step_start_time
+        total_elapsed = perf_counter() - run_start_time
+        print(f"\n{Colors.DIM}⏱️  Step completed in {step_elapsed:.2f}s (total: {total_elapsed:.2f}s){Colors.RESET}")
+
+        return None
+
     async def run(self, cancel_event: Optional[asyncio.Event] = None) -> str:
         """Execute agent loop until task is complete or max steps reached.
 
@@ -368,150 +683,27 @@ Requirements:
             # Log LLM request and call LLM with Tool objects directly
             self.logger.log_request(messages=self.messages, tools=tool_list)
 
-            try:
-                response = await self.llm.generate(messages=self.messages, tools=tool_list)
-            except Exception as e:
-                # Check if it's a retry exhausted error
-                from .retry import RetryExhaustedError
-
-                if isinstance(e, RetryExhaustedError):
-                    error_msg = f"LLM call failed after {e.attempts} retries\nLast error: {str(e.last_exception)}"
-                    print(f"\n{Colors.BRIGHT_RED}❌ Retry failed:{Colors.RESET} {error_msg}")
-                else:
-                    error_msg = f"LLM call failed: {str(e)}"
-                    print(f"\n{Colors.BRIGHT_RED}❌ Error:{Colors.RESET} {error_msg}")
-                return error_msg
-
-            # Accumulate API reported token usage
-            if response.usage:
-                self.api_total_tokens = response.usage.total_tokens
-
-            # Log LLM response
-            self.logger.log_response(
-                content=response.content,
-                thinking=response.thinking,
-                tool_calls=response.tool_calls,
-                finish_reason=response.finish_reason,
-            )
-
-            # Add assistant message
-            assistant_msg = Message(
-                role="assistant",
-                content=response.content,
-                thinking=response.thinking,
-                tool_calls=response.tool_calls,
-            )
-            self.messages.append(assistant_msg)
-
-            # Print thinking if present
-            if response.thinking:
-                print(f"\n{Colors.BOLD}{Colors.MAGENTA}🧠 Thinking:{Colors.RESET}")
-                print(f"{Colors.DIM}{response.thinking}{Colors.RESET}")
-
-            # Print assistant response
-            if response.content:
-                print(f"\n{Colors.BOLD}{Colors.BRIGHT_BLUE}🤖 Assistant:{Colors.RESET}")
-                print(f"{response.content}")
-
-            # Check if task is complete (no tool calls)
-            if not response.tool_calls:
-                step_elapsed = perf_counter() - step_start_time
-                total_elapsed = perf_counter() - run_start_time
-                print(f"\n{Colors.DIM}⏱️  Step {step + 1} completed in {step_elapsed:.2f}s (total: {total_elapsed:.2f}s){Colors.RESET}")
-                return response.content
-
-            # Check for cancellation before executing tools
-            if self._check_cancelled():
-                self._cleanup_incomplete_messages()
-                cancel_msg = "Task cancelled by user."
-                print(f"\n{Colors.BRIGHT_YELLOW}⚠️  {cancel_msg}{Colors.RESET}")
-                return cancel_msg
-
-            # Execute tool calls
-            for tool_call in response.tool_calls:
-                tool_call_id = tool_call.id
-                function_name = tool_call.function.name
-                arguments = tool_call.function.arguments
-
-                # Tool call header
-                print(f"\n{Colors.BRIGHT_YELLOW}🔧 Tool Call:{Colors.RESET} {Colors.BOLD}{Colors.CYAN}{function_name}{Colors.RESET}")
-
-                # Arguments (formatted display)
-                print(f"{Colors.DIM}   Arguments:{Colors.RESET}")
-                # Truncate each argument value to avoid overly long output
-                truncated_args = {}
-                for key, value in arguments.items():
-                    value_str = str(value)
-                    if len(value_str) > 200:
-                        truncated_args[key] = value_str[:200] + "..."
-                    else:
-                        truncated_args[key] = value
-                args_json = json.dumps(truncated_args, indent=2, ensure_ascii=False)
-                for line in args_json.split("\n"):
-                    print(f"   {Colors.DIM}{line}{Colors.RESET}")
-
-                # Execute tool
-                if function_name not in self.tools:
-                    result = ToolResult(
-                        success=False,
-                        content="",
-                        error=f"Unknown tool: {function_name}",
-                    )
-                else:
-                    try:
-                        tool = self.tools[function_name]
-                        result = await tool.execute(**arguments)
-                    except Exception as e:
-                        # Catch all exceptions during tool execution, convert to failed ToolResult
-                        import traceback
-
-                        error_detail = f"{type(e).__name__}: {str(e)}"
-                        error_trace = traceback.format_exc()
-                        result = ToolResult(
-                            success=False,
-                            content="",
-                            error=f"Tool execution failed: {error_detail}\n\nTraceback:\n{error_trace}",
-                        )
-
-                # Log tool execution result
-                self.logger.log_tool_result(
-                    tool_name=function_name,
-                    arguments=arguments,
-                    result_success=result.success,
-                    result_content=result.content if result.success else None,
-                    result_error=result.error if not result.success else None,
+            if self.stream:
+                # Use streaming for real-time token output
+                result = await self._run_step_stream(
+                    tool_list=tool_list,
+                    step_start_time=step_start_time,
+                    run_start_time=run_start_time,
                 )
-
-                # Print result
-                if result.success:
-                    result_text = result.content
-                    if len(result_text) > 300:
-                        result_text = result_text[:300] + f"{Colors.DIM}...{Colors.RESET}"
-                    print(f"{Colors.BRIGHT_GREEN}✓ Result:{Colors.RESET} {result_text}")
-                else:
-                    print(f"{Colors.BRIGHT_RED}✗ Error:{Colors.RESET} {Colors.RED}{result.error}{Colors.RESET}")
-
-                # Add tool result message
-                tool_msg = Message(
-                    role="tool",
-                    content=result.content if result.success else f"Error: {result.error}",
-                    tool_call_id=tool_call_id,
-                    name=function_name,
+                # _run_step_stream handles step increment internally
+                # Return if task complete, cancelled, or errored
+                if result is not None:
+                    return result
+            else:
+                # Use non-streaming generate() call
+                result = await self._run_step_nonstream(
+                    tool_list=tool_list,
+                    step_start_time=step_start_time,
+                    run_start_time=run_start_time,
                 )
-                self.messages.append(tool_msg)
-
-                # Check for cancellation after each tool execution
-                if self._check_cancelled():
-                    self._cleanup_incomplete_messages()
-                    cancel_msg = "Task cancelled by user."
-                    print(f"\n{Colors.BRIGHT_YELLOW}⚠️  {cancel_msg}{Colors.RESET}")
-                    return cancel_msg
-
-            step_elapsed = perf_counter() - step_start_time
-            total_elapsed = perf_counter() - run_start_time
-            print(f"\n{Colors.DIM}⏱️  Step {step + 1} completed in {step_elapsed:.2f}s (total: {total_elapsed:.2f}s){Colors.RESET}")
-
-            step += 1
+                if result is not None:
+                    return result
+                step += 1
 
         # Max steps reached
         error_msg = f"Task couldn't be completed after {self.max_steps} steps."
