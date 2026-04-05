@@ -39,6 +39,11 @@ from mini_agent.tools.note_tool import SessionNoteTool
 from mini_agent.tools.skill_tool import create_skill_tools
 from mini_agent.utils import calculate_display_width
 
+# Force unbuffered stdout for real-time streaming output
+# Must be done before any print statements
+sys.stdout.reconfigure(line_buffering=False)
+sys.stderr.reconfigure(line_buffering=False)
+
 
 # ANSI color codes
 class Colors:

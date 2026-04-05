@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import sys
 from pathlib import Path
 from time import perf_counter
 from typing import Optional
@@ -446,12 +447,24 @@ Requirements:
         finish_reason = "stop"
         total_usage = None
 
+        # Print header for streaming output
+        sys.stdout.write(f"\n{Colors.BOLD}{Colors.MAGENTA}🧠 Thinking:{Colors.RESET}\n")
+        sys.stdout.flush()
+
         try:
             stream = await self.llm.generate_stream(messages=self.messages, tools=tool_list)
             async for chunk in stream:
                 if chunk.type == "thinking":
+                    # Print thinking as it arrives (write+flush for immediate display)
+                    sys.stdout.write(chunk.text or "")
+                    sys.stdout.flush()
                     thinking_content += chunk.text or ""
                 elif chunk.type == "content":
+                    # Content arrives after thinking ends
+                    sys.stdout.write(f"\n{Colors.BOLD}{Colors.BRIGHT_BLUE}🤖 Assistant:{Colors.RESET}\n")
+                    sys.stdout.flush()
+                    sys.stdout.write(chunk.text or "")
+                    sys.stdout.flush()
                     text_content += chunk.text or ""
                 elif chunk.type == "tool_call_delta":
                     # Partial tool call - accumulate arguments
@@ -515,15 +528,8 @@ Requirements:
         )
         self.messages.append(assistant_msg)
 
-        # Print thinking if present
-        if thinking_content:
-            print(f"\n{Colors.BOLD}{Colors.MAGENTA}🧠 Thinking:{Colors.RESET}")
-            print(f"{Colors.DIM}{thinking_content}{Colors.RESET}")
-
-        # Print assistant response
-        if text_content:
-            print(f"\n{Colors.BOLD}{Colors.BRIGHT_BLUE}🤖 Assistant:{Colors.RESET}")
-            print(f"{text_content}")
+        # Content was already streamed live - just add trailing newline
+        print()  # End the streaming output line
 
         # Check if task is complete (no tool calls)
         if not final_tool_calls:
