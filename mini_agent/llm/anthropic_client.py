@@ -382,7 +382,7 @@ class AnthropicClient(LLMClientBase):
                         output_tokens = event.usage.output_tokens or 0
                         yield StreamChunk(
                             type="done",
-                            finish_reason=event.stop_reason or "stop",
+                            finish_reason=getattr(event, "stop_reason", None) or "stop",
                             usage=TokenUsage(
                                 prompt_tokens=0,
                                 completion_tokens=output_tokens,
@@ -390,4 +390,4 @@ class AnthropicClient(LLMClientBase):
                             ),
                         )
                     elif hasattr(event, "stop_reason"):
-                        yield StreamChunk(type="done", finish_reason=event.stop_reason or "stop")
+                        yield StreamChunk(type="done", finish_reason=getattr(event, "stop_reason", None) or "stop")

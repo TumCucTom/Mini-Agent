@@ -405,7 +405,7 @@ class OpenAIClient(LLMClientBase):
                             )
 
             # Check for completion
-            finish = chunk.finish_reason
+            finish = getattr(chunk, "finish_reason", None)
             if finish:
                 yield StreamChunk(
                     type="done",
