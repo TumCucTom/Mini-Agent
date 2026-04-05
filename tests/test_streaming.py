@@ -275,19 +275,11 @@ class TestAnthropicStreaming:
     @pytest.mark.asyncio
     async def test_generate_stream_content_only(self, anthropic_client):
         """Test streaming content without tool calls."""
-        class MockTextBlock:
-            type = "text"
-            text = "Hello"
-
+        # Real SDK sends type="text" as top-level event for text content
         class MockEvent:
-            """Mock content_block_delta event."""
-            def __init__(self, block_type, text=None, thinking=None):
-                self.type = "content_block_delta"
-                self.index = 0
-                if block_type == "text":
-                    self.content_block = type('obj', (), {'type': 'text', 'text': text})()
-                elif block_type == "thinking":
-                    self.content_block = type('obj', (), {'type': 'thinking', 'thinking': thinking})()
+            def __init__(self, text):
+                self.type = "text"
+                self.text = text
 
         class AsyncEventStream:
             def __init__(self, events):
@@ -305,8 +297,8 @@ class TestAnthropicStreaming:
                 return event
 
         events = [
-            MockEvent("text", text="Hello"),
-            MockEvent("text", text=", world!"),
+            MockEvent("Hello"),
+            MockEvent(", world!"),
         ]
 
         mock_client = AsyncMock()
@@ -327,11 +319,11 @@ class TestAnthropicStreaming:
     @pytest.mark.asyncio
     async def test_generate_stream_thinking(self, anthropic_client):
         """Test streaming with thinking content."""
+        # Real SDK sends type="thinking" as top-level event
         class MockEvent:
-            def __init__(self, text):
-                self.type = "content_block_delta"
-                self.index = 0
-                self.content_block = type('obj', (), {'type': 'thinking', 'thinking': text})()
+            def __init__(self, think_text):
+                self.type = "thinking"
+                self.thinking = think_text
 
         class AsyncEventStream:
             def __init__(self, events):

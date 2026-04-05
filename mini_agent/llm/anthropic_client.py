@@ -324,8 +324,16 @@ class AnthropicClient(LLMClientBase):
 
         async with self.client.messages.stream(**params) as stream:
             async for event in stream:
-                # Handle content_block_start
-                if hasattr(event, "content_block") and event.type == "content_block_start":
+                # Top-level event types with content directly on event
+                if event.type == "text":
+                    yield StreamChunk(type="content", text=event.text)
+                elif event.type == "thinking":
+                    yield StreamChunk(type="thinking", text=event.thinking)
+                elif event.type == "signature":
+                    # Signature events don't contain content to stream
+                    pass
+                # Handle content_block_start (buffer setup)
+                elif hasattr(event, "content_block") and event.type == "content_block_start":
                     block = event.content_block
                     idx = event.index
                     if block.type == "text":
@@ -340,17 +348,18 @@ class AnthropicClient(LLMClientBase):
                             "input": "",
                         }
 
-                # Handle content_block_delta
+                # Handle content_block_delta (content inside block.delta)
                 elif hasattr(event, "content_block") and event.type == "content_block_delta":
                     block = event.content_block
                     idx = event.index
-                    if block.type == "text" and hasattr(block, "text"):
-                        yield StreamChunk(type="content", text=block.text)
-                    elif block.type == "thinking" and hasattr(block, "thinking"):
-                        yield StreamChunk(type="thinking", text=block.thinking)
+                    delta = block.delta
+                    if block.type == "text" and hasattr(delta, "text"):
+                        yield StreamChunk(type="content", text=delta.text)
+                    elif block.type == "thinking" and hasattr(delta, "thinking"):
+                        yield StreamChunk(type="thinking", text=delta.thinking)
                     elif block.type == "tool_use":
-                        if hasattr(block, "input"):
-                            tool_call_buffer[idx]["input"] += block.input
+                        if hasattr(delta, "input"):
+                            tool_call_buffer[idx]["input"] += delta.input
                         # Check if tool call is complete by trying to parse
                         args_str = tool_call_buffer[idx]["input"]
                         try:
