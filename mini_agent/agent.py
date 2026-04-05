@@ -447,7 +447,8 @@ Requirements:
         total_usage = None
 
         try:
-            async for chunk in self.llm.generate_stream(messages=self.messages, tools=tool_list):
+            stream = await self.llm.generate_stream(messages=self.messages, tools=tool_list)
+            async for chunk in stream:
                 if chunk.type == "thinking":
                     thinking_content += chunk.text or ""
                 elif chunk.type == "content":
