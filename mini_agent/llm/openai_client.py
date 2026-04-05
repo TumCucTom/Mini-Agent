@@ -2,12 +2,12 @@
 
 import json
 import logging
-from typing import Any
+from typing import Any, AsyncIterator
 
 from openai import AsyncOpenAI
 
 from ..retry import RetryConfig, async_retry
-from ..schema import FunctionCall, LLMResponse, Message, TokenUsage, ToolCall
+from ..schema import FunctionCall, LLMResponse, Message, StreamChunk, TokenUsage, ToolCall
 from .base import LLMClientBase
 
 logger = logging.getLogger(__name__)
@@ -293,3 +293,122 @@ class OpenAIClient(LLMClientBase):
 
         # Parse and return response
         return self._parse_response(response)
+
+    async def generate_stream(
+        self,
+        messages: list[Message],
+        tools: list[Any] | None = None,
+    ) -> AsyncIterator[StreamChunk]:
+        """Stream LLM response as async iterator of chunks.
+
+        Args:
+            messages: List of conversation messages
+            tools: Optional list of available tools
+
+        Yields:
+            StreamChunk objects representing partial response
+        """
+        _, api_messages = self._convert_messages(messages)
+        params: dict[str, Any] = {
+            "model": self.model,
+            "messages": api_messages,
+            "extra_body": {"reasoning_split": True},
+            "stream": True,
+        }
+
+        if tools:
+            params["tools"] = self._convert_tools(tools)
+
+        # Buffer for partial tool calls indexed by tool_call index
+        tool_call_buffer: dict[int, dict[str, Any]] = {}
+
+        # Accumulate usage across all chunks
+        total_usage = None
+
+        stream = await self.client.chat.completions.create(**params)
+        async for event in stream:
+            chunk = event.choices[0]
+
+            # Accumulate usage if present
+            if hasattr(event, "usage") and event.usage:
+                total_usage = TokenUsage(
+                    prompt_tokens=event.usage.prompt_tokens or 0,
+                    completion_tokens=event.usage.completion_tokens or 0,
+                    total_tokens=event.usage.total_tokens or 0,
+                )
+
+            delta = chunk.delta
+
+            # Check for content (text or thinking)
+            if hasattr(delta, "content") and delta.content:
+                # Check if this is thinking content
+                # MiniMax uses reasoning_details for thinking
+                if hasattr(delta, "reasoning_details") and delta.reasoning_details:
+                    for rd in delta.reasoning_details:
+                        if hasattr(rd, "text") and rd.text:
+                            yield StreamChunk(type="thinking", text=rd.text)
+                # Regular content
+                yield StreamChunk(type="content", text=delta.content)
+
+            # Check for reasoning/thinking content specifically
+            if hasattr(delta, "reasoning_details") and delta.reasoning_details:
+                for rd in delta.reasoning_details:
+                    if hasattr(rd, "text") and rd.text:
+                        yield StreamChunk(type="thinking", text=rd.text)
+
+            # Check for tool calls
+            if hasattr(delta, "tool_calls") and delta.tool_calls:
+                for tc in delta.tool_calls:
+                    idx = tc.index
+                    if idx not in tool_call_buffer:
+                        tool_call_buffer[idx] = {
+                            "id": "",
+                            "name": "",
+                            "arguments": "",
+                        }
+
+                    if tc.id:
+                        tool_call_buffer[idx]["id"] = tc.id
+                    if hasattr(tc, "function"):
+                        if tc.function.name:
+                            tool_call_buffer[idx]["name"] = tc.function.name
+                        if tc.function.arguments:
+                            tool_call_buffer[idx]["arguments"] += tc.function.arguments
+
+                    # Check if this tool call is complete (has id and name and empty arguments suffix)
+                    # OpenAI streams arguments as partial JSON, we check for completion
+                    # by seeing if arguments are complete (ends with appropriate JSON terminator)
+                    args_str = tool_call_buffer[idx]["arguments"]
+                    if tool_call_buffer[idx]["id"] and tool_call_buffer[idx]["name"] and args_str:
+                        # Try to parse as JSON to see if complete
+                        try:
+                            json.loads(args_str)
+                            # Successfully parsed — tool call is complete
+                            yield StreamChunk(
+                                type="tool_call_complete",
+                                tool_call=ToolCall(
+                                    id=tool_call_buffer[idx]["id"],
+                                    type="function",
+                                    function=FunctionCall(
+                                        name=tool_call_buffer[idx]["name"],
+                                        arguments=json.loads(args_str),
+                                    ),
+                                ),
+                            )
+                            del tool_call_buffer[idx]
+                        except json.JSONDecodeError:
+                            # Incomplete JSON — emit delta
+                            yield StreamChunk(
+                                type="tool_call_delta",
+                                tool_call_id=tool_call_buffer[idx]["id"],
+                                arguments=args_str,
+                            )
+
+            # Check for completion
+            finish = chunk.finish_reason
+            if finish:
+                yield StreamChunk(
+                    type="done",
+                    finish_reason=finish,
+                    usage=total_usage,
+                )

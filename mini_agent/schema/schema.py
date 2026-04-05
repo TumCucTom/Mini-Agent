@@ -53,3 +53,16 @@ class LLMResponse(BaseModel):
     tool_calls: list[ToolCall] | None = None
     finish_reason: str
     usage: TokenUsage | None = None  # Token usage from API response
+
+
+class StreamChunk(BaseModel):
+    """A single chunk from a streaming LLM response."""
+
+    type: str  # "thinking" | "content" | "tool_call_start" | "tool_call_delta" | "tool_call_complete" | "done"
+    text: str | None = None  # For thinking / content chunks
+    tool_call_id: str | None = None  # For tool call chunks
+    tool_name: str | None = None  # For tool_call_start
+    arguments: str | None = None  # For tool_call_delta (partial JSON string fragment)
+    tool_call: ToolCall | None = None  # For tool_call_complete (full tool call)
+    finish_reason: str | None = None  # For done
+    usage: TokenUsage | None = None  # For done
