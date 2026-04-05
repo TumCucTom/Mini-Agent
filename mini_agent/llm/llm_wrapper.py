@@ -141,4 +141,4 @@ class LLMClient:
         Yields:
             StreamChunk objects representing partial response
         """
-        return self._client.generate_stream(messages, tools)
+        return await self._client.generate_stream(messages, tools)
