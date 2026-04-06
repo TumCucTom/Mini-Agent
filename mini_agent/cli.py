@@ -37,6 +37,7 @@ from mini_agent.tools.file_tools import EditTool, ReadTool, WriteTool
 from mini_agent.tools.mcp_loader import cleanup_mcp_connections, load_mcp_tools_async, set_mcp_timeout_config
 from mini_agent.tools.note_tool import SessionNoteTool
 from mini_agent.tools.skill_tool import create_skill_tools
+from mini_agent.tools.subagent_tool import SubAgentTool
 from mini_agent.utils import calculate_display_width
 
 # Force unbuffered stdout for real-time streaming output
@@ -588,6 +589,12 @@ async def run_agent(workspace_dir: Path, task: str = None, stream: bool = True):
     # 4. Add workspace-dependent tools
     add_workspace_tools(tools, config, workspace_dir)
 
+    # 4.5. Create SubAgent tool and bind it to the agent after creation
+    subagent_tool = SubAgentTool(
+        llm_client=llm_client,
+        workspace_dir=str(workspace_dir),
+    )
+
     # 5. Load System Prompt (with priority search)
     system_prompt_path = Config.find_config_file(config.agent.system_prompt_path)
     if system_prompt_path and system_prompt_path.exists():
@@ -612,6 +619,7 @@ async def run_agent(workspace_dir: Path, task: str = None, stream: bool = True):
         system_prompt = system_prompt.replace("{SKILLS_METADATA}", "")
 
     # 7. Create Agent
+    tools.append(subagent_tool)
     agent = Agent(
         llm_client=llm_client,
         system_prompt=system_prompt,
@@ -620,6 +628,8 @@ async def run_agent(workspace_dir: Path, task: str = None, stream: bool = True):
         workspace_dir=str(workspace_dir),
         stream=stream,
     )
+    # Bind subagent tool to the agent so it can access the parent's tool set
+    subagent_tool.bind_agent(agent)
 
     # 8. Display welcome information
     if not task:
