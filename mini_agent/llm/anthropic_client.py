@@ -320,16 +320,15 @@ class AnthropicClient(LLMClientBase):
             params["tools"] = self._convert_tools(tools)
 
         # Buffer for partial tool calls (indexed by block index).
-        # Note: MiniMax sends both top-level text/thinking events AND
-        # content_block_delta events — we use top-level events for text/thinking
-        # (they arrive first with full content) and content_block_delta only for tool_use.
+        # Note: MiniMax sends:
+        # - Top-level "text" / "thinking" events for content (complete, not delta)
+        # - "input_json" events for tool argument streaming
+        # - "content_block_stop" when a block (including tool_use) ends
         tool_call_buffer: dict[int, dict[str, Any]] = {}
 
         async with self.client.messages.stream(**params) as stream:
             async for event in stream:
-                # Top-level event types: these arrive BEFORE content_block_delta
-                # and carry the complete content for each block. Skip content_block_delta
-                # for text/thinking to avoid double-yielding.
+                # Top-level text/thinking — complete content, yield immediately
                 if event.type == "text":
                     yield StreamChunk(type="content", text=event.text)
                     continue
@@ -337,11 +336,9 @@ class AnthropicClient(LLMClientBase):
                     yield StreamChunk(type="thinking", text=event.thinking)
                     continue
                 elif event.type == "signature":
-                    # Signature events don't contain content to stream
                     continue
 
-                # Handle content_block_start (buffer setup for tool calls;
-                # text/thinking blocks are handled via top-level events above)
+                # Handle content_block_start — buffer setup for tool_use
                 if hasattr(event, "content_block") and event.type == "content_block_start":
                     block = event.content_block
                     idx = event.index
@@ -354,19 +351,18 @@ class AnthropicClient(LLMClientBase):
                         }
                     continue
 
-                # Handle content_block_delta (only for tool_use; text/thinking
-                # deltas are skipped since top-level events already yielded the full content)
-                if hasattr(event, "content_block") and event.type == "content_block_delta":
-                    block = event.content_block
-                    idx = event.index
-                    delta = block.delta
-                    if block.type == "tool_use":
-                        if hasattr(delta, "input"):
-                            tool_call_buffer[idx]["input"] += delta.input
-                        # Check if tool call is complete by trying to parse
-                        args_str = tool_call_buffer[idx]["input"]
+                # Handle input_json — streaming JSON arguments for tool_use blocks
+                # MiniMax API uses input_json events with partial_json field for args
+                if event.type == "input_json":
+                    if not tool_call_buffer:
+                        continue
+                    idx = max(tool_call_buffer.keys())
+                    # partial_json contains the accumulated JSON string so far
+                    partial = getattr(event, "partial_json", "") or ""
+                    if partial:
+                        tool_call_buffer[idx]["input"] = partial
                         try:
-                            parsed = json.loads(args_str) if args_str else {}
+                            parsed = json.loads(partial) if partial else {}
                             yield StreamChunk(
                                 type="tool_call_complete",
                                 tool_call=ToolCall(
@@ -383,8 +379,15 @@ class AnthropicClient(LLMClientBase):
                             yield StreamChunk(
                                 type="tool_call_delta",
                                 tool_call_id=tool_call_buffer[idx]["id"],
-                                arguments=args_str,
+                                arguments=partial,
                             )
+                    continue
+
+                # Handle content_block_stop — clean up any remaining incomplete tool calls
+                if event.type == "content_block_stop":
+                    # Clear buffer for blocks that weren't completed via input_json
+                    # (they should have been completed already, but clean up just in case)
+                    tool_call_buffer.clear()
                     continue
 
                 # Handle message_delta (final)
